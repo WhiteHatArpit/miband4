@@ -8,6 +8,8 @@ Additional debug & fixes was made by Volodymyr Shymanskyy
 
 ### Install dependencies
 
+
+
 `pip install -r requirements.txt`
 
 Turn on your Bluetooth
@@ -25,3 +27,7 @@ Run this to auth device
 If you having problems(BLE can glitch sometimes)
 
 ```sudo hciconfig hci0 reset```
+
+### If you have trouble installing bluepy
+
+```sudo apt-get install libglib2-dev  ```
