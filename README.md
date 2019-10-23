@@ -12,6 +12,15 @@ Additional debug & fixes was made by Volodymyr Shymanskyy
 
 `pip install -r requirements.txt`
 
+### Using python 3
+
+If you're having python 3.x just use following codes to automatically convert files:
+
+`2to3 -w main.py`
+`2to3 -w auth.py`
+
+### Connection to MiBand
+
 Turn on your Bluetooth
 
 Unpair you MiBand2 from current mobile apps
