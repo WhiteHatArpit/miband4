@@ -56,6 +56,7 @@ class AUTH_STATES(object):
     __metaclass__ = Immutable
 
     AUTH_OK = "Auth ok"
+    PAIR_OK = "Pair ok"
     AUTH_FAILED = "Auth failed"
     ENCRIPTION_KEY_FAILED = "Encryption key auth fail, sending new key"
     KEY_SENDING_FAILED = "Key sending failed"

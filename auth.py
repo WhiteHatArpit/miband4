@@ -4,13 +4,41 @@ import logging
 from datetime import datetime
 from Crypto.Cipher import AES
 from Queue import Queue, Empty
-from bluepy.btle import Peripheral, DefaultDelegate, ADDR_TYPE_RANDOM, BTLEException
+from bluepy.btle import Peripheral, DefaultDelegate, ADDR_TYPE_RANDOM, BTLEException, BTLEDisconnectError
 import crc16
 import os
 import struct
 
+import base64
+import hashlib
+import json
+import requests
+import urllib
+
 from constants import UUIDS, AUTH_STATES, ALERT_TYPES, QUEUE_TYPES
 
+def get_hex(data):
+    return ' '.join(x.encode('hex') for x in data)
+
+def make_hex(a):
+    a = [int(x, 16) for x in a]
+    a = [chr(x) for x in a]
+    a = ''.join(a)
+    return a
+
+def get_sign(rand):
+    url = "https://api-mifit-us.huami.com/v1/device/binds.json?r=0&t=0&device_type=0&appid=0&callid=0&channel=0&country=0&cv=0&device=0&lang=0&publickeyhash=0&timezone=0&v=0"
+    url += "&userid=3033099507"
+    url += "&" + urllib.urlencode({'random': rand})
+    
+    headers = {'apptoken': <APP_TOKEN>}
+    r = requests.get(url, headers=headers)
+    sign = r.json()['data']['signature']
+    return sign
+
+def encrypt(key, message):
+        aes = AES.new(key, AES.MODE_ECB)
+        return aes.encrypt(message)
 
 class AuthenticationDelegate(DefaultDelegate):
 
@@ -21,54 +49,76 @@ class AuthenticationDelegate(DefaultDelegate):
         self.device = device
 
     def handleNotification(self, hnd, data):
-        if hnd == self.device._char_auth.getHandle():
-            if data[:3] == b'\x10\x01\x01':
-                self.device._req_rdn()
-            elif data[:3] == b'\x10\x01\x04':
-                self.device.state = AUTH_STATES.KEY_SENDING_FAILED
-            elif data[:3] == b'\x10\x02\x01':
-                # 16 bytes
-                random_nr = data[3:]
-                self.device._send_enc_rdn(random_nr)
-            elif data[:3] == b'\x10\x02\x04':
-                self.device.state = AUTH_STATES.REQUEST_RN_ERROR
-            elif data[:3] == b'\x10\x03\x01':
-                self.device.state = AUTH_STATES.AUTH_OK
-            elif data[:3] == b'\x10\x03\x04':
-                self.device.status = AUTH_STATES.ENCRIPTION_KEY_FAILED
-                self.device._send_key()
-            else:
+        if hnd == 0x60:
+            if data[:3] == b'\x10\x01\x81':
+                const_num = data[3:]
+                self.device._log.debug("const_num: " + get_hex(const_num))
+            elif data[:3] == b'\x10\x82\x01':
+                rnd_num = data[3:]
+                self.device._log.debug("rnd_num: " + get_hex(rnd_num))
+                if self.device.is_auth:
+                    self.device._send_sign(rnd_num)
+                else:
+                    self.device._send_enc_rdn(rnd_num)
+            elif data[:3] == b'\x10\x83\x01':
+                if self.device.is_auth:
+                    self.device._log.info("Signature Accepted")
+                    self.device.waitForNotifications(self.device.timeout)
+                else:
+                    self.device._log.info("Paired!")
+                    self.device.state = AUTH_STATES.PAIR_OK
+            elif data[:3] == b'\x10\x83\x08':
+                self.device._log.info("Authentication Failed")
                 self.device.state = AUTH_STATES.AUTH_FAILED
+            elif data[:3] == b'\x10\x01\x01':
+                self.device._log.debug("Authentication Accepted")
+                self.device.state = AUTH_STATES.AUTH_OK
+            elif data[:3] == b'\x10\x01\x02':
+                self.device._log.debug("Authentication Rejected")
+                self.device.state = AUTH_STATES.AUTH_FAILED
+            elif data[:3] == b'\x10\x06\x01':
+                self.device._log.info("Unpaired")
+                self.device.state = None
+                self.device.writeCharacteristic(0x61, b'\x00\x00')
+            else:
+                self.device._log.error("Handle Notification Unknown: " + hex(hnd) + " " + get_hex(data))
+        elif hnd == 0x4d:
+            self.device._log.info("Choose on device...")
+            if not self.device.waitForNotifications(30):
+                self.device.state = AUTH_STATES.AUTH_FAILED
+
         elif hnd == self.device._char_heart_measure.getHandle():
             self.device.queue.put((QUEUE_TYPES.HEART, data))
+        
         elif hnd == 0x38:
             # Not sure about this, need test
             if len(data) == 20 and struct.unpack('b', data[0])[0] == 1:
                 self.device.queue.put((QUEUE_TYPES.RAW_ACCEL, data))
             elif len(data) == 16:
                 self.device.queue.put((QUEUE_TYPES.RAW_HEART, data))
+        
         else:
             self.device._log.error("Unhandled Response " + hex(hnd) + ": " +
                                    str(data.encode("hex")) + " len:" + str(len(data)))
 
 
-class MiBand3(Peripheral):
-    _KEY = b'\x01\x23\x45\x67\x89\x01\x22\x23\x34\x45\x56\x67\x78\x89\x90\x02'
-    _send_key_cmd = struct.pack('<18s', b'\x01\x08' + _KEY)
-    _send_rnd_cmd = struct.pack('<2s', b'\x02\x08')
-    _send_enc_key = struct.pack('<2s', b'\x03\x08')
+class MiBand4(Peripheral):
 
-    def __init__(self, mac_address, timeout=0.5, debug=False):
+    def __init__(self, mac_address, timeout=1, debug=True):
         FORMAT = '%(asctime)-15s %(name)s (%(levelname)s) > %(message)s'
         logging.basicConfig(format=FORMAT)
         log_level = logging.WARNING if not debug else logging.DEBUG
         self._log = logging.getLogger(self.__class__.__name__)
         self._log.setLevel(log_level)
 
-        self._log.info('Connecting to ' + mac_address)
-        Peripheral.__init__(self, mac_address, addrType=ADDR_TYPE_RANDOM)
-        self._log.info('Connected')
+        self.is_auth = False
+        self.is_pair = False
+        self.num = b'\x00'
 
+        self._log.info('Connecting to ' + mac_address)
+        Peripheral.__init__(self, mac_address)
+        self._log.info('Connected')
+        
         self.timeout = timeout
         self.mac_address = mac_address
         self.state = None
@@ -83,47 +133,91 @@ class MiBand3(Peripheral):
 
         self._char_auth = self.svc_2.getCharacteristics(UUIDS.CHARACTERISTIC_AUTH)[0]
         self._desc_auth = self._char_auth.getDescriptors(forUUID=UUIDS.NOTIFICATION_DESCRIPTOR)[0]
-
+        
         self._char_heart_ctrl = self.svc_heart.getCharacteristics(UUIDS.CHARACTERISTIC_HEART_RATE_CONTROL)[0]
         self._char_heart_measure = self.svc_heart.getCharacteristics(UUIDS.CHARACTERISTIC_HEART_RATE_MEASURE)[0]
 
-        # Enable auth service notifications on startup
-        self._auth_notif(True)
-        # Let band to settle
-        self.waitForNotifications(0.1)
-
+        self.setDelegate(AuthenticationDelegate(self))
+        
     # Auth helpers ######################################################################
 
-    def _auth_notif(self, enabled):
-        if enabled:
-            self._log.info("Enabling Auth Service notifications status...")
-            self._desc_auth.write(b"\x01\x00", True)
-        elif not enabled:
-            self._log.info("Disabling Auth Service notifications status...")
-            self._desc_auth.write(b"\x00\x00", True)
-        else:
-            self._log.error("Something went wrong while changing the Auth Service notifications status...")
+    def auth(self):
+        self._log.info('Authenticating...')
+        self.is_auth = True
+        
+        self._auth_notif()
+        self._req_rdn()
 
-    def _encrypt(self, message):
-        aes = AES.new(self._KEY, AES.MODE_ECB)
-        return aes.encrypt(message)
+    def pair(self):
+        if self.state != AUTH_STATES.AUTH_OK:
+            self._log.error('No Auth!')
+            return
+        self._log.info('Pairing...')
+        self.is_auth = False
+        self.is_pair = True
+        
+        self._req_rdn()
+        
+    def unpair(self):
+        if self.state != AUTH_STATES.PAIR_OK:
+            self._log.error('No Pair!')
+            return
+        self._log.info('Unpairing...')
+        self.is_auth = False
+        self.is_pair = False
+        
+        self._req_rdn()
 
-    def _send_key(self):
-        self._log.info("Sending Key...")
-        self._char_auth.write(self._send_key_cmd)
-        self.waitForNotifications(self.timeout)
+
+    def _auth_notif(self):
+        self._log.debug("Enabling Auth Service notifications status...")
+        self.writeCharacteristic(0x4e, b'\x01\x00', True)
 
     def _req_rdn(self):
-        self._log.info("Requesting random number...")
-        self._char_auth.write(self._send_rnd_cmd)
+        self._log.debug("Requesting random number...")
+        self.writeCharacteristic(0x61, b'\x01\x00', True)
+        self.writeCharacteristic(0x60, b'\x82' + self.num + b'\x02')
+        self.waitForNotifications(self.timeout)
+        
+    def _send_enc_rdn(self, rnd_num):
+        self._log.debug("Sending encrypted random number")                
+        enc_rnd = encrypt(self._KEY, rnd_num)
+        if self.is_pair:
+            cmd = b'\x83' + self.num + enc_rnd
+        else:
+            cmd = b'\x06' + self.num + enc_rnd
+        self.writeCharacteristic(0x60, cmd)
         self.waitForNotifications(self.timeout)
 
-    def _send_enc_rdn(self, data):
-        self._log.info("Sending encrypted random number")
-        cmd = self._send_enc_key + self._encrypt(data)
-        send_cmd = struct.pack('<18s', cmd)
-        self._char_auth.write(send_cmd)
+    def _send_sign(self, rnd_num):
+        self._log.debug("Sending signature")      
+        mac = make_hex(self.mac_address.split(":"))
+        new_rnd = mac + rnd_num
+        sha = hashlib.sha256(new_rnd).hexdigest()
+        
+        key = sha[:32]
+        key = make_hex(['0x'+key[i:i+2] for i in range(0, len(key), 2)])
+        self._KEY = key
+        self._log.info("Auth Key: " + get_hex(self._KEY))
+
+        rand = make_hex(['0x'+sha[i:i+2] for i in range(0, len(sha), 2)])
+        rand = base64.b64encode(rand)
+
+        sign = get_sign(rand)
+        s = base64.b64decode(sign)
+        
+        s0 = s[:15]
+        s1 = s[15:15+17]
+        s2 = s[15+17:15+17+17]
+        s3 = s[15+17+17:15+17+17+15]
+        
+        self.writeCharacteristic(0x4d, b'\x00\x04\x00\x83' + self.num + s0)
+        self.writeCharacteristic(0x4d, b'\x00\x44\x01' + s1)
+        self.writeCharacteristic(0x4d, b'\x00\x44\x02' + s2)
+        self.writeCharacteristic(0x4d, b'\x00\x44\x03' + s3 + b'\x00\x00')
+        self.writeCharacteristic(0x4d, b'\x00\x84\x04\x00\x00')
         self.waitForNotifications(self.timeout)
+                    
 
     # Parse helpers ###################################################################
 
@@ -194,37 +288,40 @@ class MiBand3(Peripheral):
                 break
 
     # API ####################################################################
+        
+    # def initialize(self):
+    #     print("initialize")
+    #     self.setDelegate(AuthenticationDelegate(self))
+    #     self._req_rdn()
+    #     self._send_key()
 
-    def initialize(self):
-        self.setDelegate(AuthenticationDelegate(self))
-        self._send_key()
+    #     while True:
+    #         self.waitForNotifications(0.1)
+    #         if self.state == AUTH_STATES.AUTH_OK:
+    #             self._log.info('Initialized')
+    #             self._auth_notif(False)
+    #             return True
+    #         elif self.state is None:
+    #             continue
 
-        while True:
-            self.waitForNotifications(0.1)
-            if self.state == AUTH_STATES.AUTH_OK:
-                self._log.info('Initialized')
-                self._auth_notif(False)
-                return True
-            elif self.state is None:
-                continue
+    #         self._log.error(self.state)
+    #         return False
 
-            self._log.error(self.state)
-            return False
+    # def authenticate(self):
+    #     print("authenticate")
+    #     self.setDelegate(AuthenticationDelegate(self))
+    #     self._req_rdn()
 
-    def authenticate(self):
-        self.setDelegate(AuthenticationDelegate(self))
-        self._req_rdn()
+    #     while True:
+    #         self.waitForNotifications(0.1)
+    #         if self.state == AUTH_STATES.AUTH_OK:
+    #             self._log.info('Authenticated')
+    #             return True
+    #         elif self.state is None:
+    #             continue
 
-        while True:
-            self.waitForNotifications(0.1)
-            if self.state == AUTH_STATES.AUTH_OK:
-                self._log.info('Authenticated')
-                return True
-            elif self.state is None:
-                continue
-
-            self._log.error(self.state)
-            return False
+    #         self._log.error(self.state)
+    #         return False
 
     def get_battery_info(self):
         char = self.svc_1.getCharacteristics(UUIDS.CHARACTERISTIC_BATTERY)[0]
@@ -298,8 +395,8 @@ class MiBand3(Peripheral):
         elif type == 4:
             base_value = '\x04\x01'
         elif type == 3:
-                base_value = '\x03\x01'
-        phone = raw_input('Sender Name or Caller ID')
+            base_value = '\x03\x01'
+        phone = "Mom" #raw_input('Sender Name or Caller ID')
         svc = self.getServiceByUUID(UUIDS.SERVICE_ALERT_NOTIFICATION)
         char = svc.getCharacteristics(UUIDS.CHARACTERISTIC_CUSTOM_ALERT)[0]
         char.write(base_value+phone, withResponse=True)
@@ -326,6 +423,7 @@ class MiBand3(Peripheral):
         # print(write_val)
         char.write('\xe2\x07\x01\x1e\x00\x00\x00\x00\x00\x00\x16', withResponse=True)
         raw_input('Date Changed, press any key to continue')
+    
     def dfuUpdate(self, fileName):
         print('Update Firmware/Resource')
         svc = self.getServiceByUUID(UUIDS.SERVICE_DFU_FIRMWARE)
@@ -376,6 +474,7 @@ class MiBand3(Peripheral):
             char.write('\x05', withResponse=True)
         print('Update Complete')
         raw_input('Press Enter to Continue')
+    
     def start_raw_data_realtime(self, heart_measure_callback=None, heart_raw_callback=None, accel_raw_callback=None):
             char_m = self.svc_heart.getCharacteristics(UUIDS.CHARACTERISTIC_HEART_RATE_MEASURE)[0]
             char_d = char_m.getDescriptors(forUUID=UUIDS.NOTIFICATION_DESCRIPTOR)[0]
@@ -404,13 +503,16 @@ class MiBand3(Peripheral):
             # WTF
             char_sensor.write(b'\x02')
             t = time.time()
-            while True:
+            x = 3
+            while x > 0:
                 self.waitForNotifications(0.5)
                 self._parse_queue()
                 # send ping request every 12 sec
                 if (time.time() - t) >= 12:
                     char_ctrl.write(b'\x16', True)
                     t = time.time()
+                    x -= 1
+            self.stop_realtime()
 
     def stop_realtime(self):
             char_m = self.svc_heart.getCharacteristics(UUIDS.CHARACTERISTIC_HEART_RATE_MEASURE)[0]
